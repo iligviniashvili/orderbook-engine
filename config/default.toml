@@ -1,0 +1,15 @@
+# Baseline configuration. Every value can be overridden by
+# config/<RUN_ENV>.toml, config/local.toml (git-ignored) or an
+# OBE__SECTION__KEY environment variable.
+
+[server]
+host = "0.0.0.0"
+port = 8080
+# How long in-flight requests get to finish after a shutdown signal.
+shutdown_grace_secs = 10
+
+[telemetry]
+service_name = "orderbook-engine"
+level = "info"
+# "pretty" for local development, "json" for production log shipping.
+format = "pretty"

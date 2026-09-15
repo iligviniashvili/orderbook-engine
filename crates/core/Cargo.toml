@@ -1,0 +1,19 @@
+[package]
+name = "obe-core"
+description = "Shared configuration, telemetry and shutdown plumbing for the orderbook-engine services"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+config.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

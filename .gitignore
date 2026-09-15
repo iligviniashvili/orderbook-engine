@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# local environment
+.env
+config/local.toml
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store

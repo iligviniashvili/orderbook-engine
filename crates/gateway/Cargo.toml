@@ -1,0 +1,26 @@
+[package]
+name = "obe-gateway"
+description = "HTTP/WebSocket gateway for the orderbook-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+obe-core.workspace = true
+
+anyhow.workspace = true
+axum.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tower-http.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+http-body-util = "0.1"
+serde_json = "1"
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true
