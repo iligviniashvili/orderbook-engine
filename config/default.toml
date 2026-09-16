@@ -7,6 +7,26 @@ host = "0.0.0.0"
 port = 8080
 # How long in-flight requests get to finish after a shutdown signal.
 shutdown_grace_secs = 10
+# Upper bound on the whole /health/ready probe. A dependency that does not
+# answer inside this budget is reported as down rather than left hanging.
+readiness_timeout_ms = 2000
+
+[database]
+# Matches the docker-compose defaults. Override with OBE__DATABASE__URL.
+url = "postgres://orderbook:orderbook@localhost:5432/orderbook"
+max_connections = 10
+min_connections = 1
+acquire_timeout_secs = 5
+idle_timeout_secs = 300
+# Deployments run the obe-migrate binary as a separate step instead.
+migrate_on_start = false
+
+[redis]
+url = "redis://localhost:6379"
+pool_size = 8
+key_prefix = "obe"
+# A cached book older than this is stale; the ingestor refreshes well inside it.
+book_ttl_secs = 30
 
 [telemetry]
 service_name = "orderbook-engine"

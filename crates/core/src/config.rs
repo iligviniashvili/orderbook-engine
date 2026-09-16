@@ -14,6 +14,8 @@ use std::time::Duration;
 use config::{Config, Environment, File, FileFormat};
 use serde::Deserialize;
 
+use crate::secret::Dsn;
+
 /// Baseline values, compiled in so the binary runs without a config directory.
 const EMBEDDED_DEFAULTS: &str = include_str!("../../../config/default.toml");
 
@@ -33,6 +35,8 @@ pub enum Error {
 pub struct Settings {
     pub server: ServerConfig,
     pub telemetry: TelemetryConfig,
+    pub database: DatabaseConfig,
+    pub redis: RedisConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -41,6 +45,33 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub shutdown_grace_secs: u64,
+    /// Budget for the whole readiness probe, so a wedged dependency cannot
+    /// make `/health/ready` hang instead of answering "down".
+    pub readiness_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseConfig {
+    pub url: Dsn,
+    pub max_connections: u32,
+    pub min_connections: u32,
+    pub acquire_timeout_secs: u64,
+    pub idle_timeout_secs: u64,
+    /// Apply pending migrations during service startup. Convenient for local
+    /// work; deployments should run `obe-migrate` as a separate step instead.
+    pub migrate_on_start: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RedisConfig {
+    pub url: Dsn,
+    pub pool_size: usize,
+    /// Namespace for every key this service writes.
+    pub key_prefix: String,
+    /// How long a cached book stays valid without a refresh from the ingestor.
+    pub book_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -103,7 +134,53 @@ impl Settings {
                 "telemetry.service_name must not be empty".into(),
             ));
         }
+        if self.server.readiness_timeout_ms == 0 {
+            return Err(Error::Invalid(
+                "server.readiness_timeout_ms must not be 0".into(),
+            ));
+        }
+        if self.database.url.is_empty() {
+            return Err(Error::Invalid("database.url must not be empty".into()));
+        }
+        if self.database.max_connections == 0 {
+            return Err(Error::Invalid(
+                "database.max_connections must be at least 1".into(),
+            ));
+        }
+        if self.database.min_connections > self.database.max_connections {
+            return Err(Error::Invalid(
+                "database.min_connections must not exceed database.max_connections".into(),
+            ));
+        }
+        if self.redis.url.is_empty() {
+            return Err(Error::Invalid("redis.url must not be empty".into()));
+        }
+        if self.redis.pool_size == 0 {
+            return Err(Error::Invalid("redis.pool_size must be at least 1".into()));
+        }
+        if self.redis.key_prefix.trim().is_empty() {
+            return Err(Error::Invalid("redis.key_prefix must not be empty".into()));
+        }
+        if self.redis.book_ttl_secs == 0 {
+            return Err(Error::Invalid("redis.book_ttl_secs must not be 0".into()));
+        }
         Ok(())
+    }
+}
+
+impl DatabaseConfig {
+    pub fn acquire_timeout(&self) -> Duration {
+        Duration::from_secs(self.acquire_timeout_secs)
+    }
+
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.idle_timeout_secs)
+    }
+}
+
+impl RedisConfig {
+    pub fn book_ttl(&self) -> Duration {
+        Duration::from_secs(self.book_ttl_secs)
     }
 }
 
@@ -117,6 +194,10 @@ impl ServerConfig {
 
     pub fn shutdown_grace(&self) -> Duration {
         Duration::from_secs(self.shutdown_grace_secs)
+    }
+
+    pub fn readiness_timeout(&self) -> Duration {
+        Duration::from_millis(self.readiness_timeout_ms)
     }
 }
 
@@ -148,6 +229,26 @@ mod tests {
         assert_eq!(settings.server.shutdown_grace_secs, 10);
         assert_eq!(settings.telemetry.format, LogFormat::Pretty);
         assert_eq!(settings.telemetry.service_name, "orderbook-engine");
+        assert!(settings.database.url.expose().starts_with("postgres://"));
+        assert!(!settings.database.migrate_on_start);
+        assert_eq!(settings.redis.key_prefix, "obe");
+    }
+
+    #[test]
+    fn debug_output_never_contains_a_password() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(
+            "OBE__DATABASE__URL",
+            "postgres://orderbook:hunter2@localhost:5432/orderbook",
+        );
+
+        let settings = embedded_only();
+
+        std::env::remove_var("OBE__DATABASE__URL");
+        let rendered = format!("{settings:?}");
+
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("***"), "{rendered}");
     }
 
     #[test]
@@ -191,26 +292,69 @@ mod tests {
             host: "127.0.0.1".into(),
             port: 8081,
             shutdown_grace_secs: 5,
+            readiness_timeout_ms: 1_500,
         };
 
         assert_eq!(cfg.socket_addr().unwrap().to_string(), "127.0.0.1:8081");
         assert_eq!(cfg.shutdown_grace(), Duration::from_secs(5));
+        assert_eq!(cfg.readiness_timeout(), Duration::from_millis(1_500));
     }
 
-    #[test]
-    fn empty_host_is_rejected() {
-        let settings = Settings {
+    fn valid_settings() -> Settings {
+        Settings {
             server: ServerConfig {
-                host: "  ".into(),
+                host: "127.0.0.1".into(),
                 port: 8080,
                 shutdown_grace_secs: 1,
+                readiness_timeout_ms: 1_000,
             },
             telemetry: TelemetryConfig {
                 service_name: "test".into(),
                 level: "info".into(),
                 format: LogFormat::Json,
             },
-        };
+            database: DatabaseConfig {
+                url: "postgres://u:p@localhost/db".into(),
+                max_connections: 4,
+                min_connections: 1,
+                acquire_timeout_secs: 5,
+                idle_timeout_secs: 300,
+                migrate_on_start: false,
+            },
+            redis: RedisConfig {
+                url: "redis://localhost:6379".into(),
+                pool_size: 4,
+                key_prefix: "obe".into(),
+                book_ttl_secs: 60,
+            },
+        }
+    }
+
+    #[test]
+    fn reference_settings_are_valid() {
+        assert!(valid_settings().validate().is_ok());
+    }
+
+    #[test]
+    fn empty_host_is_rejected() {
+        let mut settings = valid_settings();
+        settings.server.host = "  ".into();
+
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn pool_bounds_must_be_consistent() {
+        let mut settings = valid_settings();
+        settings.database.min_connections = settings.database.max_connections + 1;
+
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn empty_redis_prefix_is_rejected() {
+        let mut settings = valid_settings();
+        settings.redis.key_prefix = " ".into();
 
         assert!(settings.validate().is_err());
     }

@@ -27,6 +27,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy (TLS feature)
+        run: cargo clippy -p obe-storage --features tls --locked -- -D warnings
 
   test:
     name: build + test
@@ -39,6 +41,48 @@ jobs:
         run: cargo build --workspace --all-targets --locked
       - name: Test
         run: cargo test --workspace --locked
+
+  integration:
+    name: storage integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: orderbook
+          POSTGRES_PASSWORD: orderbook
+          POSTGRES_DB: orderbook
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U orderbook -d orderbook"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      OBE_TEST_DATABASE_URL: postgres://orderbook:orderbook@localhost:5432/orderbook
+      OBE_TEST_REDIS_URL: redis://localhost:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Apply migrations
+        run: cargo run -p obe-storage --bin obe-migrate --locked
+        env:
+          OBE__DATABASE__URL: postgres://orderbook:orderbook@localhost:5432/orderbook
+      - name: Integration tests
+        # --nocapture so a skipped test (missing service URL) is visible in the
+        # log rather than passing silently.
+        run: cargo test -p obe-storage --test integration --locked -- --nocapture
 
   compose:
     name: docker compose config
