@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/gateway"]
+members = ["crates/core", "crates/gateway", "crates/storage"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,12 +11,31 @@ repository = "https://github.com/iligviniashvili/orderbook-engine"
 
 [workspace.dependencies]
 obe-core = { path = "crates/core" }
+obe-storage = { path = "crates/storage" }
 
 anyhow = "1"
 axum = "0.8"
 config = { version = "0.15", default-features = false, features = ["toml"] }
+deadpool-redis = "0.22"
+redis = { version = "0.32", default-features = false, features = ["script"] }
+rust_decimal = { version = "1", features = ["serde-with-str"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `derive` + `migrate` only: queries are checked at runtime, so neither the
+# build nor CI needs a live database or a checked-in `.sqlx` cache. TLS is
+# behind the optional `obe-storage/tls` feature because it drags in a C
+# toolchain that a plain `cargo test` should not require.
+sqlx = { version = "0.8", default-features = false, features = [
+    "derive",
+    "migrate",
+    "json",
+    "postgres",
+    "runtime-tokio",
+    "rust_decimal",
+    "time",
+] }
 thiserror = "2"
+time = { version = "0.3", features = ["serde-well-known"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
