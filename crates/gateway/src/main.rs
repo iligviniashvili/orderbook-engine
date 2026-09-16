@@ -16,8 +16,17 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding {addr}"))?;
 
+    let state = AppState::new(&settings).context("building the storage handles")?;
+    if settings.database.migrate_on_start {
+        state
+            .store()
+            .migrate()
+            .await
+            .context("applying migrations at startup")?;
+    }
+
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let app = router(AppState::new(&settings));
+    let app = router(state);
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
         let _ = shutdown_rx.await;
     });

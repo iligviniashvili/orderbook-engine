@@ -1,7 +1,7 @@
 //! Client-facing gateway.
 //!
-//! Milestone 1 exposes health endpoints only; historical REST queries and the
-//! live WebSocket stream are added in later milestones.
+//! Health endpoints today, including readiness probes for PostgreSQL and
+//! Redis; historical REST queries and the live WebSocket stream follow.
 
 pub mod health;
 pub mod state;
