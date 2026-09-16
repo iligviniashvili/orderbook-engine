@@ -1,0 +1,40 @@
+[package]
+name = "obe-storage"
+description = "PostgreSQL persistence and Redis caching for the orderbook-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Enables rustls for PostgreSQL connections. Off by default: `ring` needs a C
+# toolchain, which the tests and the local workflow otherwise do without.
+tls = ["sqlx/tls-rustls-ring"]
+
+[[bin]]
+name = "obe-migrate"
+path = "src/bin/obe-migrate.rs"
+
+[dependencies]
+obe-core.workspace = true
+
+anyhow.workspace = true
+deadpool-redis.workspace = true
+redis.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+rust_decimal_macros = "1"
+
+[lints]
+workspace = true
