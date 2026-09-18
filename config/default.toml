@@ -28,6 +28,37 @@ key_prefix = "obe"
 # A cached book older than this is stale; the ingestor refreshes well inside it.
 book_ttl_secs = 30
 
+[ingest]
+exchange = "binance"
+# Combined stream: one socket carries every symbol and both event kinds.
+stream_url = "wss://stream.binance.com:9443/stream"
+snapshot_url = "https://api.binance.com/api/v3/depth"
+# Levels per side that get published and persisted.
+depth = 20
+# Depth requested when (re)syncing. Deeper than `depth` so deletions near the
+# top do not empty the book before the next resync.
+snapshot_depth = 1000
+trade_batch_size = 500
+trade_flush_ms = 1000
+snapshot_interval_ms = 5000
+publish_interval_ms = 250
+reconnect_base_ms = 250
+reconnect_max_ms = 30000
+
+[[ingest.instruments]]
+symbol = "BTCUSDT"
+base_asset = "BTC"
+quote_asset = "USDT"
+price_precision = 2
+quantity_precision = 5
+
+[[ingest.instruments]]
+symbol = "ETHUSDT"
+base_asset = "ETH"
+quote_asset = "USDT"
+price_precision = 2
+quantity_precision = 4
+
 [telemetry]
 service_name = "orderbook-engine"
 level = "info"

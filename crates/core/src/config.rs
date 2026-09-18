@@ -37,6 +37,7 @@ pub struct Settings {
     pub telemetry: TelemetryConfig,
     pub database: DatabaseConfig,
     pub redis: RedisConfig,
+    pub ingest: IngestConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -72,6 +73,49 @@ pub struct RedisConfig {
     pub key_prefix: String,
     /// How long a cached book stays valid without a refresh from the ingestor.
     pub book_ttl_secs: u64,
+}
+
+/// Everything the market-data ingestor needs: where the feed is, which
+/// instruments to follow, and how aggressively to batch what comes back.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IngestConfig {
+    /// Exchange slug; part of every cache key and of the `symbols` row.
+    pub exchange: String,
+    /// Combined-stream WebSocket endpoint.
+    pub stream_url: String,
+    /// REST endpoint serving the depth snapshot a resync starts from.
+    pub snapshot_url: String,
+    pub instruments: Vec<InstrumentConfig>,
+    /// Levels per side kept when a book is published or persisted.
+    pub depth: usize,
+    /// Levels per side requested from the REST snapshot on a resync. Deeper
+    /// than `depth` on purpose: the tail absorbs deletions near the top
+    /// without emptying the book before the next resync.
+    pub snapshot_depth: u16,
+    /// Trades are written in batches of this size, or sooner on the timer.
+    pub trade_batch_size: usize,
+    pub trade_flush_ms: u64,
+    /// How often a reconstructed book is written to PostgreSQL as history.
+    pub snapshot_interval_ms: u64,
+    /// How often the hot book in Redis is refreshed.
+    pub publish_interval_ms: u64,
+    /// First reconnect delay; it doubles up to `reconnect_max_ms`.
+    pub reconnect_base_ms: u64,
+    pub reconnect_max_ms: u64,
+}
+
+/// One instrument to follow. Base and quote are spelled out rather than
+/// derived by splitting the ticker: `BTCUSDT` is unambiguous only if you
+/// already know the quote assets, and guessing wrong corrupts the registry.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentConfig {
+    pub symbol: String,
+    pub base_asset: String,
+    pub quote_asset: String,
+    pub price_precision: i16,
+    pub quantity_precision: i16,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -163,6 +207,109 @@ impl Settings {
         }
         if self.redis.book_ttl_secs == 0 {
             return Err(Error::Invalid("redis.book_ttl_secs must not be 0".into()));
+        }
+        self.ingest.validate()?;
+        Ok(())
+    }
+}
+
+impl IngestConfig {
+    fn validate(&self) -> Result<(), Error> {
+        if self.exchange.trim().is_empty() {
+            return Err(Error::Invalid("ingest.exchange must not be empty".into()));
+        }
+        if !self.stream_url.starts_with("ws://") && !self.stream_url.starts_with("wss://") {
+            return Err(Error::Invalid(
+                "ingest.stream_url must be a ws:// or wss:// URL".into(),
+            ));
+        }
+        if !self.snapshot_url.starts_with("http://") && !self.snapshot_url.starts_with("https://") {
+            return Err(Error::Invalid(
+                "ingest.snapshot_url must be an http:// or https:// URL".into(),
+            ));
+        }
+        if self.depth == 0 {
+            return Err(Error::Invalid("ingest.depth must be at least 1".into()));
+        }
+        if usize::from(self.snapshot_depth) < self.depth {
+            return Err(Error::Invalid(
+                "ingest.snapshot_depth must not be smaller than ingest.depth".into(),
+            ));
+        }
+        if self.trade_batch_size == 0 {
+            return Err(Error::Invalid(
+                "ingest.trade_batch_size must be at least 1".into(),
+            ));
+        }
+        for (field, value) in [
+            ("trade_flush_ms", self.trade_flush_ms),
+            ("snapshot_interval_ms", self.snapshot_interval_ms),
+            ("publish_interval_ms", self.publish_interval_ms),
+            ("reconnect_base_ms", self.reconnect_base_ms),
+        ] {
+            if value == 0 {
+                return Err(Error::Invalid(format!("ingest.{field} must not be 0")));
+            }
+        }
+        if self.reconnect_max_ms < self.reconnect_base_ms {
+            return Err(Error::Invalid(
+                "ingest.reconnect_max_ms must not be smaller than ingest.reconnect_base_ms".into(),
+            ));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for instrument in &self.instruments {
+            instrument.validate()?;
+            if !seen.insert(instrument.symbol.to_ascii_uppercase()) {
+                return Err(Error::Invalid(format!(
+                    "ingest.instruments lists `{}` twice",
+                    instrument.symbol
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn trade_flush(&self) -> Duration {
+        Duration::from_millis(self.trade_flush_ms)
+    }
+
+    pub fn snapshot_interval(&self) -> Duration {
+        Duration::from_millis(self.snapshot_interval_ms)
+    }
+
+    pub fn publish_interval(&self) -> Duration {
+        Duration::from_millis(self.publish_interval_ms)
+    }
+
+    pub fn reconnect_base(&self) -> Duration {
+        Duration::from_millis(self.reconnect_base_ms)
+    }
+
+    pub fn reconnect_max(&self) -> Duration {
+        Duration::from_millis(self.reconnect_max_ms)
+    }
+}
+
+impl InstrumentConfig {
+    fn validate(&self) -> Result<(), Error> {
+        for (field, value) in [
+            ("symbol", &self.symbol),
+            ("base_asset", &self.base_asset),
+            ("quote_asset", &self.quote_asset),
+        ] {
+            if value.trim().is_empty() {
+                return Err(Error::Invalid(format!(
+                    "ingest.instruments[].{field} must not be blank"
+                )));
+            }
+        }
+        if !(0..=12).contains(&self.price_precision) || !(0..=12).contains(&self.quantity_precision)
+        {
+            return Err(Error::Invalid(format!(
+                "precision for `{}` must be between 0 and 12",
+                self.symbol
+            )));
         }
         Ok(())
     }
@@ -327,6 +474,26 @@ mod tests {
                 key_prefix: "obe".into(),
                 book_ttl_secs: 60,
             },
+            ingest: IngestConfig {
+                exchange: "binance".into(),
+                stream_url: "wss://example.invalid/stream".into(),
+                snapshot_url: "https://example.invalid/depth".into(),
+                instruments: vec![InstrumentConfig {
+                    symbol: "BTCUSDT".into(),
+                    base_asset: "BTC".into(),
+                    quote_asset: "USDT".into(),
+                    price_precision: 2,
+                    quantity_precision: 5,
+                }],
+                depth: 20,
+                snapshot_depth: 1_000,
+                trade_batch_size: 100,
+                trade_flush_ms: 1_000,
+                snapshot_interval_ms: 5_000,
+                publish_interval_ms: 250,
+                reconnect_base_ms: 250,
+                reconnect_max_ms: 30_000,
+            },
         }
     }
 
@@ -357,5 +524,53 @@ mod tests {
         settings.redis.key_prefix = " ".into();
 
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn the_stream_url_must_be_a_websocket_url() {
+        let mut settings = valid_settings();
+        settings.ingest.stream_url = "https://example.invalid/stream".into();
+
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn a_snapshot_shallower_than_the_published_depth_is_rejected() {
+        // Publishing 20 levels from a 10-level snapshot would serve a book
+        // that is short by construction.
+        let mut settings = valid_settings();
+        settings.ingest.depth = 20;
+        settings.ingest.snapshot_depth = 10;
+
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn a_duplicated_instrument_is_rejected() {
+        // Two tasks on one symbol would fight over the same cache key.
+        let mut settings = valid_settings();
+        let mut duplicate = settings.ingest.instruments[0].clone();
+        duplicate.symbol = duplicate.symbol.to_ascii_lowercase();
+        settings.ingest.instruments.push(duplicate);
+
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn backoff_bounds_must_be_consistent() {
+        let mut settings = valid_settings();
+        settings.ingest.reconnect_max_ms = settings.ingest.reconnect_base_ms - 1;
+
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn embedded_defaults_configure_at_least_one_instrument() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let settings = embedded_only();
+
+        assert_eq!(settings.ingest.exchange, "binance");
+        assert!(!settings.ingest.instruments.is_empty());
+        assert_eq!(settings.ingest.reconnect_base(), Duration::from_millis(250));
     }
 }
