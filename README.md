@@ -6,11 +6,13 @@ symbol in memory, persists trades and periodic snapshots to PostgreSQL, fans
 state out through Redis, and serves both historical REST queries and a live
 WebSocket stream.
 
-Status: **milestone 2 of 5** — workspace, configuration, telemetry, health
-endpoints, and the persistence layer: PostgreSQL schema with migrations, the
-query layer over it, and the Redis cache for the hot book. Ingestion and the
-public API land in the milestones below. No performance numbers are published
-yet; they will be added once there is a benchmark to measure.
+Status: **milestone 3 of 5, in progress** — workspace, configuration,
+telemetry, health endpoints, the persistence layer (PostgreSQL schema with
+migrations, the query layer over it, the Redis cache for the hot book) and now
+ingestion: an exchange WebSocket client, level-2 book reconstruction with
+sequence-gap detection, and batched writes into storage. The public REST and
+WebSocket API is the rest of this milestone. No performance numbers are
+published yet; they will be added once there is a benchmark to measure.
 
 ## Architecture
 
@@ -36,18 +38,22 @@ Crates:
 | --- | --- |
 | `crates/core` (`obe-core`) | layered configuration, tracing setup, shutdown signalling |
 | `crates/storage` (`obe-storage`) | PostgreSQL schema, migrations and queries; Redis book cache |
+| `crates/ingest` (`obe-ingest`) | exchange WebSocket client, book reconstruction, batched writes |
 | `crates/gateway` (`obe-gateway`) | HTTP service; health endpoints today, REST + WebSocket API later |
-
-The ingestor crate arrives with milestone 3.
 
 ## Running it
 
 ```bash
-docker compose up -d                      # PostgreSQL + Redis
+docker compose up -d                        # PostgreSQL + Redis
 cargo run -p obe-storage --bin obe-migrate  # apply the schema
-cargo run -p obe-gateway                  # http://0.0.0.0:8080
+cargo run -p obe-ingest                     # connect to the feed
+cargo run -p obe-gateway                    # http://0.0.0.0:8080
 curl localhost:8080/health/ready
 ```
+
+`obe-ingest` talks to Binance's public market-data endpoints by default and
+needs no credentials: it only reads. The instruments it follows are
+`ingest.instruments` in the configuration.
 
 Endpoints:
 
@@ -111,6 +117,59 @@ trade-off is deliberate: the build needs no live database and no checked-in
 `.sqlx` cache, and the schema is covered by integration tests against a real
 PostgreSQL instead.
 
+## Ingestion
+
+One WebSocket connection carries the diff-depth and trade streams for every
+configured instrument. The diff stream alone cannot bootstrap a book — it says
+what changed, not what is there — so each symbol starts from a REST depth
+snapshot and the stream is stitched onto it.
+
+The stitching is where a book quietly goes wrong, so the rules are enforced in
+`OrderBook::apply` and a violation is an error, not a log line:
+
+- An event whose final update id is at or below the snapshot's is already
+  contained in it and is dropped. Expected right after a resync.
+- The first event applied has to straddle the snapshot:
+  `first_update_id <= snapshot + 1 <= final_update_id`. If the whole event is
+  ahead of it, the updates bridging the two were never delivered and the
+  snapshot is useless.
+- Every later event has to start exactly where the last one ended.
+- A book that crosses after the ids lined up gets its own error, because that
+  is real divergence rather than a missed message.
+
+Anything in that list drops the book and refetches a snapshot. So does a
+reconnect, which restarts the stream at an arbitrary update id and would
+otherwise leave a stale book looking perfectly contiguous.
+
+Nothing buffers depth events across a resync, and nothing needs to: the socket
+is the buffer. Events that arrive while the snapshot is in flight are read
+after it and are either dropped as already contained or applied as the one that
+straddles it.
+
+The rest of the loop is about not letting a firehose become an outage:
+
+- **Trades go out in batches**, on size or on a timer. The feed read is wrapped
+  in a timeout set to what is left of the flush window, so a quiet market still
+  flushes its partial batch instead of holding the last trades indefinitely.
+- **A failed write keeps its batch.** The unique index on the exchange's trade
+  id makes the retry a no-op for whatever already landed.
+- **The buffer has an end.** Market data does not pause for a database, so past
+  eight batches the oldest trades are shed and counted. Shedding the oldest
+  keeps the most recent tape, which is the part anything downstream reads.
+- **Cache and history writes run on separate timers**, and the book is only
+  serialised once one of them is due — a busy symbol produces a hundred updates
+  a second and neither destination needs all of them.
+- **Reconnect delays are jittered.** Each is drawn from the lower half of a
+  doubling ceiling upwards; plain exponential backoff has every client come
+  back in the same instant after a venue-wide drop. A connection has to survive
+  thirty seconds before the sequence resets, otherwise a socket that accepts
+  and immediately drops turns the backoff into a hot loop.
+
+`Feed`, `SnapshotSource` and `Sink` are traits, and the pipeline is generic
+over all three, so the gap, reconnect, back-pressure and recovery paths are
+covered by tests that need no exchange, no PostgreSQL and no Redis, with the
+clock paused so the flush timer costs nothing to exercise.
+
 ## Configuration
 
 `config/default.toml` holds the baseline and is compiled into the binary, so the
@@ -122,6 +181,10 @@ overriding the previous one:
 3. `$OBE_CONFIG_DIR/$RUN_ENV.toml` — e.g. `production.toml`
 4. `$OBE_CONFIG_DIR/local.toml` — git-ignored developer overrides
 5. environment variables: `OBE__SERVER__PORT=9000`, `OBE__TELEMETRY__FORMAT=json`
+
+The `[[ingest.instruments]]` entries spell out base and quote assets rather
+than splitting the ticker: `BTCUSDT` only parses if you already know the quote
+assets, and a wrong guess corrupts the symbol registry.
 
 Unknown keys are rejected, so a typo in an override fails at startup instead of
 being silently ignored. `RUST_LOG` overrides `telemetry.level` when set.
@@ -146,7 +209,10 @@ cargo test -p obe-storage --test integration -- --nocapture
 ```
 
 TLS for PostgreSQL is behind the optional `obe-storage/tls` feature; it is off
-by default because `ring` needs a C toolchain that the tests do without.
+by default because `ring` needs a C toolchain that the tests do without. The
+ingestor's `wss://` and `https://` clients use `native-tls` for the same
+reason: it hands TLS to the platform — schannel on Windows, Secure Transport on
+macOS, the system OpenSSL on Linux — instead of building a crypto provider.
 
 CI runs fmt, clippy, build and test on every push and pull request, plus the
 integration suite against PostgreSQL and Redis service containers and a
@@ -159,7 +225,8 @@ integration suite against PostgreSQL and Redis service containers and a
 2. **Storage** — Postgres schema for symbols, trades and order-book snapshots,
    sqlx migrations, Redis caching layer. *(done)*
 3. **Ingestion and API** — exchange WebSocket client, order-book
-   reconstruction, REST history and live WebSocket fan-out.
+   reconstruction, REST history and live WebSocket fan-out. *(ingestion done;
+   the API is next)*
 4. **Integration testing** — end-to-end tests from feed to API, plus a
    throughput benchmark.
 5. **Packaging** — multi-stage Docker images, full compose stack, release CI.
