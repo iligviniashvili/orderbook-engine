@@ -9,10 +9,11 @@ WebSocket stream.
 Status: **milestone 3 of 5, in progress** — workspace, configuration,
 telemetry, health endpoints, the persistence layer (PostgreSQL schema with
 migrations, the query layer over it, the Redis cache for the hot book) and now
-ingestion: an exchange WebSocket client, level-2 book reconstruction with
-sequence-gap detection, and batched writes into storage. The public REST and
-WebSocket API is the rest of this milestone. No performance numbers are
-published yet; they will be added once there is a benchmark to measure.
+ingestion (an exchange WebSocket client, level-2 book reconstruction with
+sequence-gap detection, batched writes into storage) and the read API over
+what it produces. The live WebSocket fan-out is the rest of this milestone. No
+performance numbers are published yet; they will be added once there is a
+benchmark to measure.
 
 ## Architecture
 
@@ -39,7 +40,7 @@ Crates:
 | `crates/core` (`obe-core`) | layered configuration, tracing setup, shutdown signalling |
 | `crates/storage` (`obe-storage`) | PostgreSQL schema, migrations and queries; Redis book cache |
 | `crates/ingest` (`obe-ingest`) | exchange WebSocket client, book reconstruction, batched writes |
-| `crates/gateway` (`obe-gateway`) | HTTP service; health endpoints today, REST + WebSocket API later |
+| `crates/gateway` (`obe-gateway`) | HTTP service: health endpoints and the `/v1` read API; WebSocket fan-out later |
 
 ## Running it
 
@@ -62,6 +63,10 @@ Endpoints:
 | GET | `/health` | service name, version, uptime |
 | GET | `/health/live` | liveness: the process is running |
 | GET | `/health/ready` | readiness: PostgreSQL and Redis, probed concurrently |
+| GET | `/v1/symbols` | the instrument registry (`?active_only=false` to include delisted) |
+| GET | `/v1/books/{exchange}/{symbol}` | the current book (`?depth=N`) |
+| GET | `/v1/trades/{exchange}/{symbol}` | trade history (`?start=&end=&limit=`) |
+| GET | `/v1/vwap/{exchange}/{symbol}` | volume-weighted average price over a window |
 
 Liveness deliberately checks nothing: restarting the process because PostgreSQL
 is slow turns a degraded service into an outage. Readiness does check, under
@@ -78,6 +83,52 @@ and latency:
   ]
 }
 ```
+
+## The read API
+
+Everything under `/v1` is read-only — the service ingests from an exchange and
+serves what it reconstructed, and there is nothing a client can write.
+
+```bash
+curl 'localhost:8080/v1/books/binance/BTCUSDT?depth=2'
+```
+
+```json
+{
+  "exchange": "binance", "symbol": "BTCUSDT",
+  "source": "cache", "sequence": 71283044,
+  "captured_at": "2026-09-18T09:14:22.418Z", "age_ms": 137,
+  "spread": "0.01",
+  "bids": [{ "price": "64210.11", "quantity": "0.532" }],
+  "asks": [{ "price": "64210.12", "quantity": "1.204" }]
+}
+```
+
+Decisions worth knowing about:
+
+- **The book endpoint answers from Redis, and falls back to the newest
+  persisted snapshot.** The cache key is built from the exchange and the
+  ticker, so the warm path costs one Redis round trip and never touches
+  PostgreSQL — not even to resolve a symbol id. The response says which path
+  it took, and `age_ms` lets a client tell a live book from one whose ingestor
+  has stopped without diffing sequence numbers itself.
+- **A cache failure degrades instead of failing.** If Redis is unreachable but
+  PostgreSQL can still answer, the request is served from disk and the failure
+  is logged, because a 503 would be a worse answer than a slower one.
+- **A dependency being down is a `503`, not a `500`,** and its body never
+  carries the underlying error text: a connection failure renders the DSN's
+  host, port and user, which is not something to hand an anonymous client. The
+  detail goes to the log. A storage error that means "you asked for something
+  impossible" becomes a `400` instead.
+- **Query parameters are parsed by hand, not by a deserializer.** The caller
+  gets ``` `start` is not an RFC 3339 timestamp: `yesterday` ``` rather than
+  serde's rendering of the same fact, and the parsing is a pure function, so
+  every rejection is covered without a router or a database.
+- **Paths are normalised the way cache keys are**, so `/v1/books/Binance/btcusdt`
+  and `/v1/books/binance/BTCUSDT` are one resource rather than two that
+  disagree.
+- **Prices stay strings end to end**, through `numeric`, `jsonb`, Redis and the
+  HTTP response, so nothing in the chain can turn `0.1` into a float.
 
 ## Storage
 
@@ -197,15 +248,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-The storage integration tests need live services. They skip with a note when
-the two variables below are unset, so the command above works on a laptop with
-nothing running:
+The storage and API integration tests need live services. They skip with a note
+when the two variables below are unset, so the command above works on a laptop
+with nothing running:
 
 ```bash
 docker compose up -d
 export OBE_TEST_DATABASE_URL=postgres://orderbook:orderbook@localhost:5432/orderbook
 export OBE_TEST_REDIS_URL=redis://localhost:6379
 cargo test -p obe-storage --test integration -- --nocapture
+cargo test -p obe-gateway --test api -- --nocapture
 ```
 
 TLS for PostgreSQL is behind the optional `obe-storage/tls` feature; it is off
@@ -215,8 +267,8 @@ reason: it hands TLS to the platform — schannel on Windows, Secure Transport o
 macOS, the system OpenSSL on Linux — instead of building a crypto provider.
 
 CI runs fmt, clippy, build and test on every push and pull request, plus the
-integration suite against PostgreSQL and Redis service containers and a
-`docker compose config` validation.
+integration and API suites against PostgreSQL and Redis service containers and
+a `docker compose config` validation.
 
 ## Roadmap
 
@@ -225,8 +277,8 @@ integration suite against PostgreSQL and Redis service containers and a
 2. **Storage** — Postgres schema for symbols, trades and order-book snapshots,
    sqlx migrations, Redis caching layer. *(done)*
 3. **Ingestion and API** — exchange WebSocket client, order-book
-   reconstruction, REST history and live WebSocket fan-out. *(ingestion done;
-   the API is next)*
+   reconstruction, REST history and live WebSocket fan-out. *(ingestion and the
+   REST API done; the WebSocket fan-out is next)*
 4. **Integration testing** — end-to-end tests from feed to API, plus a
    throughput benchmark.
 5. **Packaging** — multi-stage Docker images, full compose stack, release CI.
