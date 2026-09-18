@@ -83,6 +83,8 @@ jobs:
         # --nocapture so a skipped test (missing service URL) is visible in the
         # log rather than passing silently.
         run: cargo test -p obe-storage --test integration --locked -- --nocapture
+      - name: API tests
+        run: cargo test -p obe-gateway --test api --locked -- --nocapture
 
   compose:
     name: docker compose config
