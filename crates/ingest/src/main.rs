@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use obe_core::{shutdown_signal, telemetry, InstrumentConfig, Settings};
-use obe_ingest::{Backoff, HttpSnapshotSource, Pipeline, StorageSink, WebSocketFeed};
+use obe_core::{shutdown_signal, telemetry, Backoff, InstrumentConfig, Settings};
+use obe_ingest::{HttpSnapshotSource, Pipeline, StorageSink, WebSocketFeed};
 use obe_storage::{BookCache, NewSymbol, Store};
 
 /// Budget for one REST depth snapshot. Generous — it is a kilobyte or two of

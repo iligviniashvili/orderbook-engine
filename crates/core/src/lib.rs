@@ -1,11 +1,14 @@
 //! Shared building blocks for the orderbook-engine services: layered
-//! configuration, tracing setup and graceful-shutdown signalling.
+//! configuration, reconnect backoff, tracing setup and graceful-shutdown
+//! signalling.
 
+pub mod backoff;
 pub mod config;
 pub mod secret;
 pub mod shutdown;
 pub mod telemetry;
 
+pub use backoff::Backoff;
 pub use config::{
     DatabaseConfig, Error as ConfigError, IngestConfig, InstrumentConfig, LogFormat, RedisConfig,
     ServerConfig, Settings, TelemetryConfig,

@@ -6,6 +6,10 @@
 //! outage going. Each delay is therefore drawn uniformly from the lower half
 //! of the current ceiling upwards ("equal jitter"), which spreads the retries
 //! while keeping a floor, so a client cannot hot-loop on a fast failure.
+//!
+//! Shared rather than per-crate: the ingestor reconnecting to an exchange and
+//! the gateway reconnecting to Redis pub/sub are the same problem, and a
+//! second copy would be a second set of off-by-one bugs.
 
 use std::time::Duration;
 

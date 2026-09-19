@@ -8,11 +8,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 
-use obe_core::IngestConfig;
+use obe_core::{Backoff, IngestConfig};
 use obe_storage::{BookSnapshot, NewTrade, Write};
 use tokio::time::{Duration, Instant};
 
-use crate::backoff::Backoff;
 use crate::book::{Applied, OrderBook};
 use crate::error::Result;
 use crate::feed::{Feed, FeedItem};
