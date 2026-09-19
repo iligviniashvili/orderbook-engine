@@ -19,7 +19,13 @@ axum = "0.8"
 config = { version = "0.15", default-features = false, features = ["toml"] }
 deadpool-redis = "0.22"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
-redis = { version = "0.32", default-features = false, features = ["script"] }
+# `tokio-comp` is what makes `Client::get_async_pubsub` available: a
+# subscriber needs a connection of its own, because a subscribed connection
+# stops accepting ordinary commands and so cannot come from the shared pool.
+redis = { version = "0.32", default-features = false, features = [
+    "script",
+    "tokio-comp",
+] }
 # `native-tls` rather than a rustls backend, for the same reason the storage
 # TLS feature is optional: rustls needs a crypto provider that wants a C
 # toolchain, while native-tls hands TLS to the platform — schannel on Windows,
@@ -48,7 +54,9 @@ sqlx = { version = "0.8", default-features = false, features = [
 thiserror = "2"
 time = { version = "0.3", features = ["serde-well-known"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
-tokio-tungstenite = { version = "0.30", default-features = false, features = [
+# Pinned to the minor axum 0.8 depends on, so the workspace builds one copy of
+# the WebSocket stack instead of two that cannot exchange types.
+tokio-tungstenite = { version = "0.29", default-features = false, features = [
     "connect",
     "native-tls",
 ] }
