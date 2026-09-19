@@ -6,13 +6,13 @@ symbol in memory, persists trades and periodic snapshots to PostgreSQL, fans
 state out through Redis, and serves both historical REST queries and a live
 WebSocket stream.
 
-Status: **milestone 3 of 5, done** — workspace, configuration, telemetry,
+Status: **milestone 4 of 5, done** — workspace, configuration, telemetry,
 health endpoints, the persistence layer (PostgreSQL schema with migrations,
 the query layer over it, the Redis cache for the hot book), ingestion (an
 exchange WebSocket client, level-2 book reconstruction with sequence-gap
 detection, batched writes into storage), the read API over what it produces,
-and the live WebSocket fan-out at `/v1/stream`. No performance numbers are
-published yet; they will be added once there is a benchmark to measure.
+the live WebSocket fan-out at `/v1/stream`, end-to-end tests from feed to
+client, and a benchmark with [measured numbers](#performance).
 
 ## Architecture
 
@@ -40,6 +40,7 @@ Crates:
 | `crates/storage` (`obe-storage`) | PostgreSQL schema, migrations and queries; Redis book cache |
 | `crates/ingest` (`obe-ingest`) | exchange WebSocket client, book reconstruction, batched writes |
 | `crates/gateway` (`obe-gateway`) | HTTP service: health endpoints, the `/v1` read API and the `/v1/stream` WebSocket fan-out |
+| `crates/bench` (`obe-bench`) | throughput measurements for the hot paths |
 
 ## Running it
 
@@ -292,6 +293,56 @@ window instead of one per trade. That is the trade: the tape arrives in
 `trade_flush_ms` steps, while the book — the latency-sensitive half — moves on
 the much shorter `publish_interval_ms`.
 
+## Performance
+
+```bash
+cargo run --release -p obe-bench                  # 200k events per pass
+cargo run --release -p obe-bench -- --json        # machine readable
+```
+
+Read the numbers below for what they are: **CPU cost on one core, with
+PostgreSQL and Redis deliberately absent.** They are not a claim about what a
+deployment sustains, and nothing here has run in production. With a database
+in the loop the figure would be a measurement of the database, and the shape
+of the code above it would vanish into the round trip; the question the
+benchmark answers is where the CPU goes.
+
+Measured on an AMD Athlon Silver 3050U (2 cores, 2 threads) running Windows 11,
+release build, 200,000 events per pass, best of three after a warm-up:
+
+| scenario | throughput | per operation |
+| --- | --- | --- |
+| decode wire frames | 285,000 events/s | 3.5 µs |
+| apply deltas to the book | 1,645,000 events/s | 0.61 µs |
+| decode and apply | 246,000 events/s | 4.1 µs |
+| ingest pipeline, sinks in memory | 1,188,000 events/s | 0.84 µs |
+| stream fan-out, 100 subscribers | 20,055,000 deliveries/s | 0.05 µs |
+
+That is amortised throughput, not a latency distribution: these operations run
+in hundreds of nanoseconds, and timing each one individually would spend a
+meaningful share of the measurement on the instrument.
+
+Two things the first run said, and what came of them:
+
+- **Decoding cost about seven times what applying the result to the book
+  cost**, which is the wrong shape — the book is where the thinking happens.
+  `parse_frame` was building a whole `serde_json::Value` for every frame, an
+  allocated tree with an owned `String` per key and per value, purely to find
+  out whether the payload was wrapped in `data`. Routing on two borrowed
+  `RawValue` spans instead took decoding from 4.6 µs to 3.5 µs per event. What
+  is left is mostly `Decimal` parsing — eight per depth event — which is the
+  price of never routing a price through an `f64`, and a trade this project
+  makes on purpose. It stops there: an exchange feed does not deliver 285,000
+  events a second, and going further would be optimising for the benchmark.
+- **Fan-out is nearly free per subscriber.** One update reaching a hundred
+  clients costs about 50 ns per delivery, because what each one receives is an
+  `Arc` of the publisher's bytes rather than a re-encoded book. That is the
+  design in the [live stream](#the-live-stream) section, measured.
+
+CI runs the benchmark on a small workload and asserts nothing about the
+numbers — a shared runner is not a measurement instrument. The job is there so
+the benchmark cannot rot unnoticed between the times it is run in earnest.
+
 ## Configuration
 
 `config/default.toml` holds the baseline and is compiled into the binary, so the
@@ -329,7 +380,18 @@ export OBE_TEST_DATABASE_URL=postgres://orderbook:orderbook@localhost:5432/order
 export OBE_TEST_REDIS_URL=redis://localhost:6379
 cargo test -p obe-storage --test integration -- --nocapture
 cargo test -p obe-gateway --test api -- --nocapture
+cargo test -p obe-gateway --test end_to_end -- --nocapture --test-threads=1
 ```
+
+`end_to_end` stands up a real ingestor and a real gateway against those
+services and drives a scripted exchange feed through both, checking what comes
+out of the REST endpoints and the WebSocket. It runs single-threaded: each
+case builds its own deployment, and serialising them keeps the publish-tick
+timing in the assertions rather than in the scheduler.
+
+The WebSocket suite (`cargo test -p obe-gateway --test stream`) needs nothing
+running — the hub's input is a channel, so it exercises the real socket path
+with no Redis at all.
 
 TLS for PostgreSQL is behind the optional `obe-storage/tls` feature; it is off
 by default because `ring` needs a C toolchain that the tests do without. The
@@ -338,8 +400,8 @@ reason: it hands TLS to the platform — schannel on Windows, Secure Transport o
 macOS, the system OpenSSL on Linux — instead of building a crypto provider.
 
 CI runs fmt, clippy, build and test on every push and pull request, plus the
-integration and API suites against PostgreSQL and Redis service containers and
-a `docker compose config` validation.
+integration, API and end-to-end suites against PostgreSQL and Redis service
+containers, a small benchmark run, and a `docker compose config` validation.
 
 ## Roadmap
 
@@ -350,7 +412,7 @@ a `docker compose config` validation.
 3. **Ingestion and API** — exchange WebSocket client, order-book
    reconstruction, REST history and live WebSocket fan-out. *(done)*
 4. **Integration testing** — end-to-end tests from feed to API, plus a
-   throughput benchmark.
+   throughput benchmark. *(done)*
 5. **Packaging** — multi-stage Docker images, full compose stack, release CI.
 
 ## License
