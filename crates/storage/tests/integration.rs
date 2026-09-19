@@ -11,7 +11,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use obe_core::Settings;
-use obe_storage::{BookCache, BookSnapshot, Level, NewSymbol, NewTrade, Side, Store, TradeQuery};
+use obe_storage::{
+    BookCache, BookSnapshot, Kind, Level, NewSymbol, NewTrade, Side, Store, StreamEvent,
+    StreamPublisher, StreamSubscriber, StreamTrade, Topic, TradeQuery,
+};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use time::{Duration, OffsetDateTime};
@@ -480,4 +483,135 @@ async fn cached_books_carry_an_expiry() {
         cache.ttl()
     );
     assert!(remaining > std::time::Duration::ZERO);
+}
+
+/// A publisher and a subscriber sharing one namespace, or `None` when Redis is
+/// not configured.
+fn stream() -> Option<(StreamPublisher, StreamSubscriber)> {
+    let Ok(url) = std::env::var(REDIS_URL) else {
+        eprintln!("skipping: {REDIS_URL} is not set");
+        return None;
+    };
+
+    let mut cfg = settings().redis;
+    cfg.url = url.as_str().into();
+    cfg.key_prefix = unique("obetest");
+
+    Some((
+        StreamPublisher::connect_lazy(&cfg).expect("publisher should build"),
+        StreamSubscriber::connect_lazy(&cfg).expect("subscriber should build"),
+    ))
+}
+
+fn book_event(exchange: &str, sequence: i64) -> StreamEvent {
+    StreamEvent::Book {
+        exchange: exchange.to_owned(),
+        symbol: "BTCUSDT".into(),
+        sequence,
+        captured_at: OffsetDateTime::now_utc(),
+        bids: vec![Level::new(dec!(30000.10), dec!(1.5))],
+        asks: vec![Level::new(dec!(30000.20), dec!(0.75))],
+    }
+}
+
+/// `PUBLISH` reports how many subscribers it reached, but a `PSUBSCRIBE` that
+/// has been acknowledged by the client is not always visible to a publisher on
+/// another connection yet. Retry until it is, rather than sleeping a guess.
+async fn publish_until_delivered(publisher: &StreamPublisher, event: &StreamEvent) {
+    for _ in 0..100 {
+        if publisher.publish(event).await.expect("publish") > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the subscription never became visible to the publisher");
+}
+
+#[tokio::test]
+async fn an_event_reaches_a_subscriber_with_its_payload_untouched() {
+    let Some((publisher, subscriber)) = stream() else {
+        return;
+    };
+    let exchange = unique("exchange");
+    let mut subscription = subscriber.subscribe().await.expect("subscribe");
+
+    let event = book_event(&exchange, 4_242);
+    publish_until_delivered(&publisher, &event).await;
+
+    let message = subscription
+        .next()
+        .await
+        .expect("the subscription should stay open")
+        .expect("the payload should route");
+
+    assert_eq!(message.topic, Topic::new(Kind::Book, &exchange, "BTCUSDT"));
+    assert_eq!(message.sequence, Some(4_242));
+    // The gateway forwards these bytes verbatim, so they have to survive the
+    // round trip exactly, decimals included.
+    assert_eq!(
+        serde_json::from_str::<StreamEvent>(&message.payload).expect("payload should decode"),
+        event
+    );
+}
+
+#[tokio::test]
+async fn one_pattern_subscription_covers_every_instrument() {
+    let Some((publisher, subscriber)) = stream() else {
+        return;
+    };
+    let exchange = unique("exchange");
+    let mut subscription = subscriber.subscribe().await.expect("subscribe");
+
+    // Subscribed by glob, so an instrument the gateway never heard of at
+    // startup still arrives.
+    publish_until_delivered(&publisher, &book_event(&exchange, 1)).await;
+
+    let tape = StreamEvent::Trades {
+        exchange: exchange.clone(),
+        symbol: "SOLUSDT".into(),
+        trades: vec![StreamTrade {
+            trade_id: 7,
+            price: dec!(100.25),
+            quantity: dec!(0.5),
+            side: Side::Sell,
+            traded_at: OffsetDateTime::now_utc(),
+        }],
+    };
+    assert!(publisher.publish(&tape).await.expect("publish") > 0);
+
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let message = subscription
+            .next()
+            .await
+            .expect("the subscription should stay open")
+            .expect("the payload should route");
+        seen.push(message.topic.name());
+    }
+
+    assert!(
+        seen.contains(&format!("book:{exchange}:BTCUSDT")),
+        "{seen:?}"
+    );
+    assert!(
+        seen.contains(&format!("trades:{exchange}:SOLUSDT")),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn publishing_with_nobody_listening_is_not_an_error() {
+    let Some((publisher, _)) = stream() else {
+        return;
+    };
+
+    // The normal state of a service with no clients attached. Ingestion must
+    // not treat it as a failure.
+    assert_eq!(
+        publisher
+            .publish(&book_event(&unique("exchange"), 1))
+            .await
+            .expect("publish"),
+        0
+    );
 }

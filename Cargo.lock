@@ -1181,6 +1181,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "deadpool-redis",
+ "futures-util",
  "obe-core",
  "redis",
  "rust_decimal",
