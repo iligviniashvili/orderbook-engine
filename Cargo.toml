@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/gateway", "crates/ingest", "crates/storage"]
+members = [
+    "crates/bench",
+    "crates/core",
+    "crates/gateway",
+    "crates/ingest",
+    "crates/storage",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +17,7 @@ repository = "https://github.com/iligviniashvili/orderbook-engine"
 
 [workspace.dependencies]
 obe-core = { path = "crates/core" }
+obe-gateway = { path = "crates/gateway" }
 obe-ingest = { path = "crates/ingest" }
 obe-storage = { path = "crates/storage" }
 
