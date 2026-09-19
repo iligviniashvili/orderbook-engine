@@ -395,7 +395,23 @@ async fn a_scripted_feed_becomes_a_book_a_tape_and_a_live_stream() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["count"], 2);
-    assert_eq!(body["trades"][0]["price"], "100.75");
+    // Compared as a decimal, not as text. A price that went through
+    // `numeric(24, 12)` comes back carrying the column's scale —
+    // `100.750000000000`, the same number the stream sent as `100.75`. Exact
+    // either way, which is the point of never touching a float, but the two
+    // representations are not the same string and a test should not pretend
+    // they are.
+    assert_eq!(decimal(&body["trades"][0]["price"]), dec!(100.75));
+}
+
+/// Parses a price out of a JSON response. Prices are strings end to end, so
+/// anything that is not one is a bug worth failing on loudly.
+fn decimal(value: &Value) -> Decimal {
+    value
+        .as_str()
+        .expect("prices should be JSON strings")
+        .parse()
+        .expect("prices should be decimals")
 }
 
 #[tokio::test]
