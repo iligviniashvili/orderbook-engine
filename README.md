@@ -6,14 +6,13 @@ symbol in memory, persists trades and periodic snapshots to PostgreSQL, fans
 state out through Redis, and serves both historical REST queries and a live
 WebSocket stream.
 
-Status: **milestone 3 of 5, in progress** — workspace, configuration,
-telemetry, health endpoints, the persistence layer (PostgreSQL schema with
-migrations, the query layer over it, the Redis cache for the hot book) and now
-ingestion (an exchange WebSocket client, level-2 book reconstruction with
-sequence-gap detection, batched writes into storage) and the read API over
-what it produces. The live WebSocket fan-out is the rest of this milestone. No
-performance numbers are published yet; they will be added once there is a
-benchmark to measure.
+Status: **milestone 3 of 5, done** — workspace, configuration, telemetry,
+health endpoints, the persistence layer (PostgreSQL schema with migrations,
+the query layer over it, the Redis cache for the hot book), ingestion (an
+exchange WebSocket client, level-2 book reconstruction with sequence-gap
+detection, batched writes into storage), the read API over what it produces,
+and the live WebSocket fan-out at `/v1/stream`. No performance numbers are
+published yet; they will be added once there is a benchmark to measure.
 
 ## Architecture
 
@@ -40,7 +39,7 @@ Crates:
 | `crates/core` (`obe-core`) | layered configuration, tracing setup, shutdown signalling |
 | `crates/storage` (`obe-storage`) | PostgreSQL schema, migrations and queries; Redis book cache |
 | `crates/ingest` (`obe-ingest`) | exchange WebSocket client, book reconstruction, batched writes |
-| `crates/gateway` (`obe-gateway`) | HTTP service: health endpoints and the `/v1` read API; WebSocket fan-out later |
+| `crates/gateway` (`obe-gateway`) | HTTP service: health endpoints, the `/v1` read API and the `/v1/stream` WebSocket fan-out |
 
 ## Running it
 
@@ -67,6 +66,7 @@ Endpoints:
 | GET | `/v1/books/{exchange}/{symbol}` | the current book (`?depth=N`) |
 | GET | `/v1/trades/{exchange}/{symbol}` | trade history (`?start=&end=&limit=`) |
 | GET | `/v1/vwap/{exchange}/{symbol}` | volume-weighted average price over a window |
+| GET | `/v1/stream` | WebSocket: live books and trades |
 
 Liveness deliberately checks nothing: restarting the process because PostgreSQL
 is slow turns a degraded service into an outage. Readiness does check, under
@@ -129,6 +129,70 @@ Decisions worth knowing about:
   disagree.
 - **Prices stay strings end to end**, through `numeric`, `jsonb`, Redis and the
   HTTP response, so nothing in the chain can turn `0.1` into a float.
+
+## The live stream
+
+`/v1/stream` is a WebSocket. A client subscribes to channels named
+`book:<exchange>:<symbol>` or `trades:<exchange>:<symbol>` and gets the
+matching updates pushed as they happen.
+
+```json
+{ "op": "subscribe", "channels": ["book:binance:BTCUSDT", "trades:binance:BTCUSDT"] }
+```
+
+The server acknowledges with the full topic set, then sends the cached book
+straight away and follows it with updates:
+
+```json
+{ "type": "subscribed", "channels": ["book:binance:BTCUSDT", "trades:binance:BTCUSDT"] }
+{ "type": "book", "exchange": "binance", "symbol": "BTCUSDT", "sequence": 71283044,
+  "captured_at": "2026-09-19T09:14:22.418Z",
+  "bids": [{ "price": "64210.11", "quantity": "0.532" }], "asks": [] }
+{ "type": "trades", "exchange": "binance", "symbol": "BTCUSDT",
+  "trades": [{ "trade_id": 4211, "price": "64210.12", "quantity": "0.004",
+               "side": "buy", "traded_at": "2026-09-19T09:14:22.502Z" }] }
+```
+
+`{"op":"unsubscribe","channels":[...]}` and `{"op":"ping"}` are the other two
+commands. Both acks name the whole topic set, so a client never has to track
+what it thinks it asked for.
+
+Decisions worth knowing about:
+
+- **One Redis subscription per gateway process, not per client.** Every
+  connection is a `broadcast` receiver behind a single `PSUBSCRIBE`, so the
+  load Redis sees does not grow with the number of clients. What each client
+  receives is an `Arc` of the publisher's own bytes: the gateway parses a
+  three-field routing header and never re-serialises a book, so fanning one
+  update out to a hundred sockets is a hundred pointer clones and a hundred
+  writes.
+- **Subscribing sends the cached book first, then the stream.** The same
+  snapshot-then-deltas bootstrap the ingestor performs against the exchange,
+  for the same reason: updates alone cannot tell you what is already there. A
+  cold or unreachable cache costs a client its head start, not its
+  subscription.
+- **The stream is not ordered, so every book event carries its sequence.**
+  Publishes leave the ingestor through a pooled connection and can take
+  different sockets. The gateway keeps a per-topic high-water mark and drops
+  anything that is not newer — the monotonic rule the cache enforces in Lua,
+  one layer further out — and clients should do the same. The watermark is
+  forgotten after the cached book's TTL, so an exchange that restarts its
+  update ids cannot wedge a topic for the life of the process.
+- **A client that falls behind is told.** Rather than skipping messages
+  silently, a lagging connection gets `{"type":"lagged","missed":N}`; a gap a
+  client does not know about is a chart that is quietly wrong. The right
+  response is to re-read `/v1/books/...` and carry on.
+- **The stream is a live view, not a durability claim.** The tape goes out
+  before the batch is written and regardless of how that write ends, so a
+  PostgreSQL outage costs the service its record without also costing
+  subscribers their feed. Nothing is replayed after a disconnect — pub/sub has
+  no history, and the REST endpoints are there for what happened.
+- **A book only streams once the cache accepted it.** The fan-out is gated on
+  the compare-and-set, so the stream and `/v1/books/...` can never disagree
+  about which snapshot is newest.
+- **Connections are bounded**: 64 topics each, 16 KiB inbound frames, and a
+  peer that has said nothing for 45 seconds is closed. TCP will happily hold a
+  socket open to a laptop that shut its lid, and each one pins a task.
 
 ## Storage
 
@@ -221,6 +285,13 @@ over all three, so the gap, reconnect, back-pressure and recovery paths are
 covered by tests that need no exchange, no PostgreSQL and no Redis, with the
 clock paused so the flush timer costs nothing to exercise.
 
+The live stream is fed from the same loop. The book goes out on the publish
+tick, gated on the cache having accepted it; the tape shares the flush
+boundary with the durable write, which costs one publish per symbol per flush
+window instead of one per trade. That is the trade: the tape arrives in
+`trade_flush_ms` steps, while the book — the latency-sensitive half — moves on
+the much shorter `publish_interval_ms`.
+
 ## Configuration
 
 `config/default.toml` holds the baseline and is compiled into the binary, so the
@@ -277,8 +348,7 @@ a `docker compose config` validation.
 2. **Storage** — Postgres schema for symbols, trades and order-book snapshots,
    sqlx migrations, Redis caching layer. *(done)*
 3. **Ingestion and API** — exchange WebSocket client, order-book
-   reconstruction, REST history and live WebSocket fan-out. *(ingestion and the
-   REST API done; the WebSocket fan-out is next)*
+   reconstruction, REST history and live WebSocket fan-out. *(done)*
 4. **Integration testing** — end-to-end tests from feed to API, plus a
    throughput benchmark.
 5. **Packaging** — multi-stage Docker images, full compose stack, release CI.

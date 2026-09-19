@@ -1,12 +1,13 @@
 //! Where reconstructed market data goes.
 //!
 //! A trait, so the pipeline can be driven end to end in a unit test with
-//! neither PostgreSQL nor Redis running, and so the two very different write
-//! paths — durable history and the hot book — stay behind one seam.
+//! neither PostgreSQL nor Redis running, and so the three very different write
+//! paths — durable history, the hot book, the live stream — stay behind one
+//! seam.
 
 use std::future::Future;
 
-use obe_storage::{BookCache, BookSnapshot, NewTrade, Store, Write};
+use obe_storage::{BookCache, BookSnapshot, NewTrade, Store, StreamEvent, StreamPublisher, Write};
 
 use crate::error::Result;
 
@@ -27,21 +28,34 @@ pub trait Sink: Send + Sync {
     /// Durable book history. Returns `false` when that sequence was already
     /// stored.
     fn write_snapshot(&self, book: &BookSnapshot) -> impl Future<Output = Result<bool>> + Send;
+
+    /// Fan-out to whoever is watching live. Returns how many subscribers the
+    /// transport reached, which is normally zero — a service with no clients
+    /// attached is not a failure.
+    fn broadcast(&self, event: &StreamEvent) -> impl Future<Output = Result<u32>> + Send;
 }
 
-/// The production sink: PostgreSQL for history, Redis for the hot book.
+/// The production sink: PostgreSQL for history, Redis for the hot book and for
+/// the live stream.
 #[derive(Debug, Clone)]
 pub struct StorageSink {
     store: Store,
     cache: BookCache,
+    stream: StreamPublisher,
     exchange: String,
 }
 
 impl StorageSink {
-    pub fn new(store: Store, cache: BookCache, exchange: impl Into<String>) -> Self {
+    pub fn new(
+        store: Store,
+        cache: BookCache,
+        stream: StreamPublisher,
+        exchange: impl Into<String>,
+    ) -> Self {
         Self {
             store,
             cache,
+            stream,
             exchange: exchange.into(),
         }
     }
@@ -58,5 +72,9 @@ impl Sink for StorageSink {
 
     async fn write_snapshot(&self, book: &BookSnapshot) -> Result<bool> {
         Ok(self.store.insert_snapshot(book).await?)
+    }
+
+    async fn broadcast(&self, event: &StreamEvent) -> Result<u32> {
+        Ok(self.stream.publish(event).await?)
     }
 }

@@ -15,9 +15,14 @@ pub mod error;
 pub mod model;
 pub mod postgres;
 pub mod repository;
+pub mod stream;
 
 pub use cache::{BookCache, Write};
 pub use error::{Error, Result};
 pub use model::{BookSnapshot, Level, NewSymbol, NewTrade, Side, Symbol, Trade};
 pub use postgres::{Store, MIGRATOR};
 pub use repository::{TradeQuery, MAX_TRADE_LIMIT};
+pub use stream::{
+    Channels, Kind, StreamEvent, StreamMessage, StreamPublisher, StreamSubscriber, StreamTrade,
+    Subscription, Topic,
+};

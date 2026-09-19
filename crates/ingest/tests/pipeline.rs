@@ -14,7 +14,7 @@ use obe_core::{IngestConfig, InstrumentConfig};
 use obe_ingest::error::{Error, Result};
 use obe_ingest::protocol::{DepthDelta, DepthSnapshot, TradeEvent};
 use obe_ingest::{Feed, FeedEvent, FeedItem, Pipeline, Sink, SnapshotSource};
-use obe_storage::{BookSnapshot, Level, NewTrade, Side, Write};
+use obe_storage::{BookSnapshot, Level, NewTrade, Side, StreamEvent, Write};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use time::OffsetDateTime;
@@ -92,12 +92,24 @@ struct RecordingSink {
     trades: Mutex<Vec<NewTrade>>,
     books: Mutex<Vec<BookSnapshot>>,
     snapshots: Mutex<Vec<BookSnapshot>>,
+    broadcasts: Mutex<Vec<StreamEvent>>,
     trades_fail: AtomicBool,
+    stream_fail: AtomicBool,
+    /// `Write::Stale`, as a cache that already holds a newer book would say.
+    book_stale: AtomicBool,
 }
 
 impl RecordingSink {
     fn set_trades_fail(&self, fail: bool) {
         self.trades_fail.store(fail, Ordering::SeqCst);
+    }
+
+    fn set_stream_fail(&self, fail: bool) {
+        self.stream_fail.store(fail, Ordering::SeqCst);
+    }
+
+    fn set_book_stale(&self, stale: bool) {
+        self.book_stale.store(stale, Ordering::SeqCst);
     }
 
     fn trades(&self) -> Vec<NewTrade> {
@@ -106,6 +118,10 @@ impl RecordingSink {
 
     fn books(&self) -> Vec<BookSnapshot> {
         self.books.lock().unwrap().clone()
+    }
+
+    fn broadcasts(&self) -> Vec<StreamEvent> {
+        self.broadcasts.lock().unwrap().clone()
     }
 }
 
@@ -119,6 +135,9 @@ impl Sink for RecordingSink {
     }
 
     async fn publish_book(&self, _symbol: &str, book: &BookSnapshot) -> Result<Write> {
+        if self.book_stale.load(Ordering::SeqCst) {
+            return Ok(Write::Stale);
+        }
         self.books.lock().unwrap().push(book.clone());
         Ok(Write::Stored)
     }
@@ -126,6 +145,14 @@ impl Sink for RecordingSink {
     async fn write_snapshot(&self, book: &BookSnapshot) -> Result<bool> {
         self.snapshots.lock().unwrap().push(book.clone());
         Ok(true)
+    }
+
+    async fn broadcast(&self, event: &StreamEvent) -> Result<u32> {
+        if self.stream_fail.load(Ordering::SeqCst) {
+            return Err(Error::Closed);
+        }
+        self.broadcasts.lock().unwrap().push(event.clone());
+        Ok(1)
     }
 }
 
@@ -448,4 +475,117 @@ async fn events_for_unfollowed_symbols_are_ignored() {
     assert_eq!(pipeline.stats().events, 1);
     assert_eq!(pipeline.stats().trades_buffered, 0);
     assert_eq!(pipeline.stats().trades_written, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_published_book_is_also_fanned_out_live() {
+    let mut pipeline = pipeline(
+        vec![depth(101, 105, dec!(100))],
+        FakeSource::new(vec![snapshot(100)]),
+        RecordingSink::default(),
+        config(),
+    );
+
+    drive(&mut pipeline, 1).await;
+
+    let events = pipeline.sink().broadcasts();
+    assert_eq!(events.len(), 1);
+    let StreamEvent::Book {
+        ref exchange,
+        ref symbol,
+        sequence,
+        ref bids,
+        ..
+    } = events[0]
+    else {
+        panic!("expected a book event, got {:?}", events[0]);
+    };
+
+    assert_eq!(exchange, "binance");
+    assert_eq!(symbol, SYMBOL);
+    assert_eq!(sequence, 105);
+    assert_eq!(bids[0], Level::new(dec!(100), dec!(1)));
+    assert_eq!(pipeline.stats().stream_events, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_book_the_cache_rejected_is_not_streamed_either() {
+    let mut pipeline = pipeline(
+        vec![depth(101, 105, dec!(100))],
+        FakeSource::new(vec![snapshot(100)]),
+        RecordingSink::default(),
+        config(),
+    );
+    pipeline.sink().set_book_stale(true);
+
+    drive(&mut pipeline, 1).await;
+
+    // A newer book is already cached, so publishing this one would hand
+    // subscribers an older top of book than the REST endpoint would return.
+    assert_eq!(pipeline.stats().books_published, 0);
+    assert!(pipeline.sink().broadcasts().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_tape_is_fanned_out_once_per_flush_not_once_per_trade() {
+    let mut pipeline = pipeline(
+        vec![trade(1), trade(2), trade(3)],
+        FakeSource::new(vec![snapshot(100)]),
+        RecordingSink::default(),
+        config(),
+    );
+
+    // Three trades is the configured batch size, so one flush carries them.
+    drive(&mut pipeline, 3).await;
+
+    let events = pipeline.sink().broadcasts();
+    assert_eq!(events.len(), 1, "one message, not one per trade");
+    let StreamEvent::Trades { ref trades, .. } = events[0] else {
+        panic!("expected a tape event, got {:?}", events[0]);
+    };
+    assert_eq!(
+        trades.iter().map(|t| t.trade_id).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_tape_goes_out_even_when_the_database_will_not_take_it() {
+    let mut pipeline = pipeline(
+        vec![trade(1), trade(2), trade(3)],
+        FakeSource::new(vec![snapshot(100)]),
+        RecordingSink::default(),
+        config(),
+    );
+    pipeline.sink().set_trades_fail(true);
+
+    drive(&mut pipeline, 3).await;
+
+    // The stream is a live view, not a durability claim: a PostgreSQL outage
+    // costs the record, and it should not also cost subscribers their feed.
+    assert_eq!(pipeline.stats().trades_written, 0);
+    assert_eq!(pipeline.stats().sink_failures, 1);
+    assert_eq!(pipeline.sink().broadcasts().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dead_stream_is_counted_and_does_not_stall_ingestion() {
+    let mut pipeline = pipeline(
+        vec![depth(101, 105, dec!(100)), trade(1), trade(2), trade(3)],
+        FakeSource::new(vec![snapshot(100)]),
+        RecordingSink::default(),
+        config(),
+    );
+    pipeline.sink().set_stream_fail(true);
+
+    drive(&mut pipeline, 4).await;
+
+    let stats = pipeline.stats();
+    assert_eq!(stats.stream_events, 0);
+    assert_eq!(stats.stream_failures, 2, "one book, one tape");
+    // Books and durable history are unaffected — the counters are separate
+    // because the two failures mean very different things.
+    assert_eq!(stats.books_published, 1);
+    assert_eq!(stats.trades_written, 3);
+    assert_eq!(stats.sink_failures, 0);
 }

@@ -8,11 +8,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 
-use obe_core::IngestConfig;
-use obe_storage::{BookSnapshot, NewTrade, Write};
+use obe_core::{Backoff, IngestConfig};
+use obe_storage::{BookSnapshot, NewTrade, StreamEvent, StreamTrade, Write};
 use tokio::time::{Duration, Instant};
 
-use crate::backoff::Backoff;
 use crate::book::{Applied, OrderBook};
 use crate::error::Result;
 use crate::feed::{Feed, FeedItem};
@@ -52,6 +51,11 @@ pub struct Stats {
     pub resyncs: u64,
     pub sequence_breaks: u64,
     pub sink_failures: u64,
+    /// Messages handed to the live stream. Counted separately from
+    /// `sink_failures` because a stream that is down costs subscribers a feed,
+    /// while a database that is down costs the service its record.
+    pub stream_events: u64,
+    pub stream_failures: u64,
 }
 
 /// Drives one feed into storage.
@@ -62,6 +66,10 @@ pub struct Pipeline<F, S, K> {
     sink: K,
     cfg: IngestConfig,
     symbols: HashMap<String, SymbolState>,
+    /// `symbol_id` back to the exchange's ticker. The buffer holds rows keyed
+    /// by id because that is what PostgreSQL wants; the stream is addressed by
+    /// ticker because that is what a client subscribes to.
+    tickers: HashMap<i32, String>,
     pending: VecDeque<NewTrade>,
     last_flush: Instant,
     stats: Stats,
@@ -99,12 +107,18 @@ where
             })
             .collect();
 
+        let tickers = instruments
+            .iter()
+            .map(|(symbol, id)| (*id, symbol.trim().to_ascii_uppercase()))
+            .collect();
+
         Self {
             feed,
             source,
             sink,
             cfg,
             symbols,
+            tickers,
             pending: VecDeque::new(),
             last_flush: now,
             stats: Stats::default(),
@@ -268,6 +282,11 @@ where
             return;
         }
 
+        // The tape goes out before the write and regardless of how it ends.
+        // The stream is a live view, not a durability claim, and a PostgreSQL
+        // outage should cost subscribers nothing.
+        self.broadcast_trades().await;
+
         let batch = self.pending.make_contiguous();
         match self.sink.write_trades(batch).await {
             Ok(written) => {
@@ -286,6 +305,59 @@ where
         }
     }
 
+    /// Fans the buffered trades out, one message per symbol in the batch.
+    ///
+    /// Sharing the flush boundary with the durable write is the whole point:
+    /// the stream costs one publish per symbol per flush window rather than
+    /// one per trade, at the price of the tape arriving in `trade_flush_ms`
+    /// steps rather than continuously. The book, which is the latency-
+    /// sensitive half, is on its own and much shorter `publish_interval_ms`.
+    async fn broadcast_trades(&mut self) {
+        let mut batches: HashMap<i32, Vec<StreamTrade>> = HashMap::new();
+        for trade in &self.pending {
+            batches
+                .entry(trade.symbol_id)
+                .or_default()
+                .push(StreamTrade {
+                    trade_id: trade.exchange_trade_id,
+                    price: trade.price,
+                    quantity: trade.quantity,
+                    side: trade.side,
+                    traded_at: trade.traded_at,
+                });
+        }
+
+        for (symbol_id, trades) in batches {
+            let Some(symbol) = self.tickers.get(&symbol_id).cloned() else {
+                continue;
+            };
+            self.broadcast(StreamEvent::Trades {
+                exchange: self.cfg.exchange.clone(),
+                symbol,
+                trades,
+            })
+            .await;
+        }
+    }
+
+    /// Hands one event to the stream. Failures are counted and dropped: a
+    /// subscriber missing an update is not a reason to stall the loop that
+    /// keeps the books correct.
+    async fn broadcast(&mut self, event: StreamEvent) {
+        match self.sink.broadcast(&event).await {
+            Ok(_) => self.stats.stream_events += 1,
+            Err(error) => {
+                self.stats.stream_failures += 1;
+                tracing::warn!(
+                    symbol = event.symbol(),
+                    kind = event.kind().as_str(),
+                    %error,
+                    "publishing to the live stream failed"
+                );
+            }
+        }
+    }
+
     /// Pushes the book to the cache, and to durable history on the slower
     /// timer. Both are rate limited: a busy symbol produces a hundred book
     /// updates a second and neither destination needs to see all of them.
@@ -299,7 +371,21 @@ where
     ) {
         if publish {
             match self.sink.publish_book(symbol, snapshot).await {
-                Ok(Write::Stored) => self.stats.books_published += 1,
+                Ok(Write::Stored) => {
+                    self.stats.books_published += 1;
+                    // Gated on the cache having accepted it, so the live
+                    // stream and the cached book can never disagree about
+                    // which snapshot is the newest.
+                    self.broadcast(StreamEvent::Book {
+                        exchange: self.cfg.exchange.clone(),
+                        symbol: symbol.to_owned(),
+                        sequence: snapshot.sequence,
+                        captured_at: snapshot.captured_at,
+                        bids: snapshot.bids.clone(),
+                        asks: snapshot.asks.clone(),
+                    })
+                    .await;
+                }
                 // Another writer is ahead on this symbol; the cache kept the
                 // newer book, which is the right outcome.
                 Ok(Write::Stale) => {}

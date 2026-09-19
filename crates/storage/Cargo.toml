@@ -22,6 +22,7 @@ obe-core.workspace = true
 
 anyhow.workspace = true
 deadpool-redis.workspace = true
+futures-util.workspace = true
 redis.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
@@ -35,6 +36,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 rust_decimal_macros = "1"
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

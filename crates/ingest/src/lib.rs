@@ -7,7 +7,6 @@
 //! and a [`sink::Sink`] together and is generic over all three, so the whole
 //! loop can be driven in a unit test with nothing running.
 
-pub mod backoff;
 pub mod book;
 pub mod error;
 pub mod feed;
@@ -16,7 +15,6 @@ pub mod protocol;
 pub mod sink;
 pub mod source;
 
-pub use backoff::Backoff;
 pub use book::{Applied, OrderBook, SequenceError};
 pub use error::{Error, Result};
 pub use feed::{Feed, FeedItem, WebSocketFeed};

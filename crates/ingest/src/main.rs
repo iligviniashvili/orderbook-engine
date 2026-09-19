@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use obe_core::{shutdown_signal, telemetry, InstrumentConfig, Settings};
-use obe_ingest::{Backoff, HttpSnapshotSource, Pipeline, StorageSink, WebSocketFeed};
-use obe_storage::{BookCache, NewSymbol, Store};
+use obe_core::{shutdown_signal, telemetry, Backoff, InstrumentConfig, Settings};
+use obe_ingest::{HttpSnapshotSource, Pipeline, StorageSink, WebSocketFeed};
+use obe_storage::{BookCache, NewSymbol, Store, StreamPublisher};
 
 /// Budget for one REST depth snapshot. Generous — it is a kilobyte or two of
 /// JSON — but bounded, because a resync that never returns is a symbol that
@@ -22,6 +22,8 @@ async fn main() -> anyhow::Result<()> {
 
     let store = Store::connect_lazy(&settings.database).context("building the database pool")?;
     let cache = BookCache::connect_lazy(&settings.redis).context("building the cache pool")?;
+    let stream =
+        StreamPublisher::connect_lazy(&settings.redis).context("building the stream publisher")?;
 
     // The registry is the one thing that must be reachable before ingestion
     // starts: without a symbol id there is nothing to key a trade on. The
@@ -50,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let source = HttpSnapshotSource::new(&cfg.snapshot_url, SNAPSHOT_TIMEOUT)
         .context("building the snapshot client")?;
-    let sink = StorageSink::new(store, cache, &cfg.exchange);
+    let sink = StorageSink::new(store, cache, stream, &cfg.exchange);
 
     let mut pipeline = Pipeline::new(feed, source, sink, cfg, &instruments);
     pipeline.run(shutdown_signal()).await?;

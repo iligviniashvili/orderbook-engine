@@ -12,9 +12,11 @@ obe-core.workspace = true
 obe-storage.workspace = true
 
 anyhow.workspace = true
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
+futures-util.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["time", "sync"] }
@@ -24,8 +26,9 @@ tracing.workspace = true
 [dev-dependencies]
 http-body-util = "0.1"
 rust_decimal_macros = "1"
-serde_json.workspace = true
 sqlx.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tokio-tungstenite.workspace = true
 tower = { workspace = true, features = ["util"] }
 
 [lints]

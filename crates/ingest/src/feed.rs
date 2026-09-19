@@ -13,9 +13,9 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::backoff::Backoff;
 use crate::error::Result;
 use crate::protocol::{parse_frame, FeedEvent};
+use obe_core::Backoff;
 
 /// How long a connection has to survive before it is treated as healthy and
 /// the backoff sequence is allowed to start over. Without it, a socket that
