@@ -24,7 +24,12 @@ tower-http.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The end-to-end suite drives the real ingest pipeline into the real gateway;
+# the dependency only exists for tests, and points one way.
+obe-ingest.workspace = true
+
 http-body-util = "0.1"
+rust_decimal.workspace = true
 rust_decimal_macros = "1"
 sqlx.workspace = true
 tokio = { workspace = true, features = ["net"] }

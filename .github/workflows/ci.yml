@@ -85,6 +85,24 @@ jobs:
         run: cargo test -p obe-storage --test integration --locked -- --nocapture
       - name: API tests
         run: cargo test -p obe-gateway --test api --locked -- --nocapture
+      - name: End-to-end tests
+        # One test binary, one thread: each case stands up its own ingestor and
+        # gateway against the shared services, and serialising them keeps the
+        # publish-tick timing in the assertions rather than in the scheduler.
+        run: cargo test -p obe-gateway --test end_to_end --locked -- --nocapture --test-threads=1
+
+  bench:
+    name: benchmark smoke run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # A small workload, and nothing is asserted on the numbers: a shared CI
+      # runner is not a measurement instrument. This is here so the benchmark
+      # cannot rot unnoticed between the times it is run in earnest.
+      - name: Run the benchmark
+        run: cargo run --release -p obe-bench --locked -- --events 5000 --subscribers 20
 
   compose:
     name: docker compose config
