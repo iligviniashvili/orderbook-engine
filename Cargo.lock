@@ -1120,6 +1120,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "obe-bench"
+version = "0.1.0"
+dependencies = [
+ "obe-core",
+ "obe-gateway",
+ "obe-ingest",
+ "obe-storage",
+ "rust_decimal",
+ "serde_json",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "obe-core"
 version = "0.1.0"
 dependencies = [
@@ -1140,6 +1154,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "obe-core",
+ "obe-ingest",
  "obe-storage",
  "rust_decimal",
  "rust_decimal_macros",

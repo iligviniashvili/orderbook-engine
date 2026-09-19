@@ -11,6 +11,7 @@
 use rust_decimal::Decimal;
 use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use time::OffsetDateTime;
 
 use obe_storage::{Level, Side};
@@ -73,26 +74,55 @@ pub enum ProtocolError {
     Timestamp(i64),
 }
 
+/// Just the two things routing needs: whether the payload is wrapped, and
+/// whether it carries an event discriminator at all.
+///
+/// Both are [`RawValue`], which records where a value sits in the input
+/// without decoding or allocating it. The discriminator is never read — the
+/// tag on [`Payload`] does the matching — so borrowing its span is enough, and
+/// it cannot fail on an escaped string the way a `&str` would.
+#[derive(Debug, Deserialize)]
+struct Envelope<'a> {
+    #[serde(borrow, default)]
+    data: Option<&'a RawValue>,
+    #[serde(rename = "e", borrow, default)]
+    kind: Option<&'a RawValue>,
+}
+
 /// Parses one text frame from the combined stream.
 ///
 /// Returns `None` for frames that are valid but carry nothing to ingest: the
 /// subscription acknowledgements the exchange sends on connect, and event
 /// kinds this service does not consume. Those are not errors, and treating
 /// them as errors would tear down a healthy socket.
+///
+/// This deliberately does not build a `serde_json::Value` first. Doing so used
+/// to cost a whole allocated tree — a map and an owned `String` per key and
+/// per value, a `Vec` per side — before a single field was read, and the
+/// benchmark had decoding at several times the cost of applying the result to
+/// the book. Routing on borrowed spans and then deserialising the body once,
+/// straight into the wire types, takes those allocations out of the hot path.
 pub fn parse_frame(raw: &str) -> Result<Option<FeedEvent>, ProtocolError> {
-    let frame: serde_json::Value = serde_json::from_str(raw)?;
+    let envelope: Envelope = serde_json::from_str(raw)?;
+
     // The combined stream wraps the payload in `data`; a single-stream socket
     // sends it bare.
-    let body = frame.get("data").unwrap_or(&frame);
+    let (body, kind) = match envelope.data {
+        Some(data) => {
+            let inner: Envelope = serde_json::from_str(data.get())?;
+            (data.get(), inner.kind)
+        }
+        None => (raw, envelope.kind),
+    };
 
     // No discriminator means a control frame, not a market-data event. Parsing
     // is only attempted once one is present, so a genuinely malformed event
     // still fails loudly instead of being waved through as "unknown kind".
-    if body.get("e").is_none() {
+    if kind.is_none() {
         return Ok(None);
     }
 
-    match Payload::deserialize(body)? {
+    match serde_json::from_str::<Payload>(body)? {
         Payload::Depth(wire) => Ok(Some(FeedEvent::Depth(wire.try_into()?))),
         Payload::Trade(wire) => Ok(Some(FeedEvent::Trade(wire.try_into()?))),
         Payload::Other => Ok(None),

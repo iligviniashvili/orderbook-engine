@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/gateway", "crates/ingest", "crates/storage"]
+members = [
+    "crates/bench",
+    "crates/core",
+    "crates/gateway",
+    "crates/ingest",
+    "crates/storage",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +17,7 @@ repository = "https://github.com/iligviniashvili/orderbook-engine"
 
 [workspace.dependencies]
 obe-core = { path = "crates/core" }
+obe-gateway = { path = "crates/gateway" }
 obe-ingest = { path = "crates/ingest" }
 obe-storage = { path = "crates/storage" }
 
@@ -36,7 +43,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 rust_decimal = { version = "1", features = ["serde-with-str"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 # `macros` is here for the `FromRow` derive and `migrate!`, not for the
 # compile-time-checked `query!` family: queries stay runtime-checked, so
 # neither the build nor CI needs a live database or a checked-in `.sqlx`
